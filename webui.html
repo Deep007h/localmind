@@ -307,6 +307,7 @@
             <div class="conversation-list" id="conversation-list"></div>
             <div class="sidebar-footer">
                 <button class="sidebar-btn" onclick="showModelManager()">📦 Model Manager</button>
+                <button class="sidebar-btn" onclick="showCloudProviders()">☁️ Cloud Models</button>
                 <button class="sidebar-btn" onclick="showSystemStats()">💻 System Health</button>
                 <button class="sidebar-btn" onclick="showSettings()">⚙️ Settings</button>
                 <button class="sidebar-btn" onclick="toggleTheme()">🌓 Theme</button>
@@ -451,7 +452,7 @@
         mermaid.initialize({ startOnLoad: false, theme: 'dark' });
         
         async function init() {
-            await loadModels();
+            await loadAllModels();
             await loadConversations();
             loadSettings();
             startStatsPolling();
@@ -475,18 +476,47 @@
             } catch(e) { console.error(e); }
         }
         
+        let allCloudModels = [];
+        
+        async function loadAllModels() {
+            await loadModels();
+            try {
+                const resp = await fetch('/api/cloud-models');
+                allCloudModels = await resp.json();
+            } catch(e) { allCloudModels = []; }
+            updateModelSelector();
+        }
+        
         function updateModelSelector() {
             const sel = document.getElementById('model-selector');
             const defSel = document.getElementById('default-model');
             sel.innerHTML = '';
             defSel.innerHTML = '';
+            
+            const localGroup = document.createElement('optgroup');
+            localGroup.label = 'Local (Ollama)';
             availableModels.forEach(m => {
                 const opt = document.createElement('option');
                 opt.value = m.name;
                 opt.textContent = m.name + (m.badges ? ' [' + m.badges.join(' ') + ']' : '');
-                sel.appendChild(opt);
+                localGroup.appendChild(opt);
                 defSel.appendChild(opt.cloneNode(true));
             });
+            sel.appendChild(localGroup);
+            
+            if (allCloudModels.length > 0) {
+                const cloudGroup = document.createElement('optgroup');
+                cloudGroup.label = 'Cloud';
+                allCloudModels.forEach(m => {
+                    const opt = document.createElement('option');
+                    opt.value = m.id;
+                    opt.textContent = `${m.name} (${m.provider})`;
+                    cloudGroup.appendChild(opt);
+                    defSel.appendChild(opt.cloneNode(true));
+                });
+                sel.appendChild(cloudGroup);
+            }
+            
             if (availableModels.length > 0 && !currentModel) {
                 currentModel = availableModels[0].name;
             }
@@ -693,14 +723,26 @@
             streamController = new AbortController();
             window._currentStream = streamController;
             
+            const isCloudModel = model.includes(':');
             const ollamaHost = localStorage.getItem('ollamaHost') || 'http://localhost:11434';
             
             try {
-                const res = await fetch(`${ollamaHost}/api/chat`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    signal: streamController.signal,
-                    body: JSON.stringify({
+                let url, body, headers;
+                
+                if (isCloudModel) {
+                    url = '/api/chat/cloud';
+                    headers = { 'Content-Type': 'application/json' };
+                    body = JSON.stringify({
+                        model: model,
+                        messages: messages,
+                        stream: true,
+                        temperature: params.temperature,
+                        max_tokens: params.max_tokens
+                    });
+                } else {
+                    url = `${ollamaHost}/api/chat`;
+                    headers = { 'Content-Type': 'application/json' };
+                    body = JSON.stringify({
                         model: model,
                         messages: messages,
                         stream: true,
@@ -712,8 +754,20 @@
                             repeat_penalty: params.repeat_penalty,
                             seed: params.seed || undefined
                         }
-                    })
+                    });
+                }
+                
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: headers,
+                    signal: streamController.signal,
+                    body: body
                 });
+                
+                if (!res.ok) {
+                    const err = await res.text();
+                    throw new Error(err);
+                }
                 
                 const reader = res.body.getReader();
                 const decoder = new TextDecoder();
@@ -733,36 +787,53 @@
                     buffer = lines.pop();
                     
                     for (const line of lines) {
-                        if (!line.trim()) continue;
+                        if (!line.trim() || line === 'data: [DONE]') continue;
                         try {
-                            const json = JSON.parse(line);
-                            if (json.message?.content) {
-                                const chunk = json.message.content;
+                            let json;
+                            if (line.startsWith('data: ')) {
+                                json = JSON.parse(line.slice(6));
+                            } else {
+                                json = JSON.parse(line);
+                            }
+                            
+                            let content = '';
+                            if (isCloudModel) {
+                                if (json.choices && json.choices[0].delta && json.choices[0].delta.content) {
+                                    content = json.choices[0].delta.content;
+                                } else if (json.choices && json.choices[0].message) {
+                                    content = json.choices[0].message.content;
+                                }
+                            } else {
+                                content = json.message?.content || '';
+                            }
+                            
+                            if (content) {
                                 if (!firstTokenTime) firstTokenTime = Date.now() - startTime;
                                 tokenCount++;
                                 
-                                if (chunk.includes('<think>')) { inReasoning = true; }
+                                if (content.includes('<think>')) { inReasoning = true; }
                                 if (inReasoning) {
-                                    reasoning += chunk;
-                                    if (chunk.includes('')) {
+                                    reasoning += content;
+                                    if (content.includes('')) {
                                         inReasoning = false;
                                         onToken({ type: 'reasoning', content: reasoning });
                                         reasoning = '';
-                                        const afterThink = chunk.split('')[1] || '';
+                                        const afterThink = content.split('')[1] || '';
                                         if (afterThink) onToken({ type: 'text', content: afterThink });
                                     }
                                     continue;
                                 }
-                                onToken({ type: 'text', content: chunk });
+                                onToken({ type: 'text', content: content });
                             }
-                            if (json.done) {
+                            
+                            if (json.choices && json.choices[0].finish_reason) {
                                 totalDuration = Date.now() - startTime;
                                 onDone({
-                                    totalTokens: json.eval_count || tokenCount,
-                                    promptTokens: json.prompt_eval_count || 0,
+                                    totalTokens: tokenCount,
+                                    promptTokens: 0,
                                     duration: totalDuration,
                                     firstTokenMs: firstTokenTime,
-                                    tokensPerSec: json.eval_count ? json.eval_count / (json.eval_duration / 1e9) : null
+                                    tokensPerSec: tokenCount / (totalDuration / 1000)
                                 });
                             }
                         } catch(e) {}
@@ -1081,6 +1152,177 @@
         
         function branchMessage(msgId) {
             showToast('Branched!', 'success');
+        }
+        
+        let cloudProviders = [];
+        let cloudModels = [];
+        
+        async function showCloudProviders() {
+            showModal(`
+                <h2>☁️ Cloud Providers</h2>
+                <div id="cloud-providers-list"></div>
+                <button onclick="showAddCloudProvider()" style="margin-top:16px;padding:10px 20px;background:var(--accent);border:none;border-radius:6px;cursor:pointer;">+ Add Provider</button>
+                <h3 style="margin-top:24px;">Available Cloud Models</h3>
+                <div id="cloud-models-list" style="margin-top:12px;"></div>
+            `);
+            await loadCloudProviders();
+            await loadCloudModels();
+        }
+        
+        async function loadCloudProviders() {
+            try {
+                const resp = await fetch('/api/cloud-providers');
+                cloudProviders = await resp.json();
+                renderCloudProviders();
+            } catch(e) { console.error(e); }
+        }
+        
+        async function loadCloudModels() {
+            try {
+                const resp = await fetch('/api/cloud-models');
+                cloudModels = await resp.json();
+                renderCloudModels();
+            } catch(e) { console.error(e); }
+        }
+        
+        function renderCloudProviders() {
+            const list = document.getElementById('cloud-providers-list');
+            if (cloudProviders.length === 0) {
+                list.innerHTML = '<p style="color:var(--text3);padding:12px;">No cloud providers configured</p>';
+                return;
+            }
+            list.innerHTML = cloudProviders.map(p => `
+                <div style="padding:12px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <strong>${p.name}</strong>
+                        <span style="color:var(--text3);font-size:12px;">${p.api_key || 'No API key'}</span>
+                    </div>
+                    <div>
+                        <button onclick="toggleCloudProvider('${p.id}', ${p.enabled})" style="padding:4px 8px;background:var(--bg2);border:1px solid var(--border);border-radius:4px;cursor:pointer;color:${p.enabled ? 'var(--green)' : 'var(--text3)'}">${p.enabled ? 'Enabled' : 'Disabled'}</button>
+                        <button onclick="deleteCloudProvider('${p.id}')" style="padding:4px 8px;background:var(--red);border:none;border-radius:4px;cursor:pointer;color:white;margin-left:8px;">Delete</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        function renderCloudModels() {
+            const list = document.getElementById('cloud-models-list');
+            if (cloudModels.length === 0) {
+                list.innerHTML = '<p style="color:var(--text3);">No cloud models available. Add a provider first.</p>';
+                return;
+            }
+            list.innerHTML = cloudModels.map(m => `
+                <div style="padding:8px 12px;background:var(--bg2);border-radius:6px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <span style="color:var(--accent);">${m.name}</span>
+                        <span style="color:var(--text3);font-size:12px;"> - ${m.provider}</span>
+                        ${m.supports_vision ? '<span style="background:var(--purple);color:white;padding:2px 6px;border-radius:4px;font-size:10px;margin-left:8px;">VISION</span>' : ''}
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        async function showAddCloudProvider() {
+            let availableProviders = [];
+            try {
+                const resp = await fetch('/api/cloud-providers/available');
+                availableProviders = await resp.json();
+            } catch(e) { return; }
+            
+            const options = Object.entries(availableProviders).map(([key, val]) => 
+                `<option value="${key}">${val.name}</option>`
+            ).join('');
+            
+            showModal(`
+                <h2>Add Cloud Provider</h2>
+                <div class="settings-group">
+                    <div class="settings-label">Provider</div>
+                    <select class="settings-select" id="new-provider-type" onchange="updateProviderFields()">
+                        <option value="">Select a provider...</option>
+                        ${options}
+                    </select>
+                </div>
+                <div id="provider-fields"></div>
+                <button onclick="saveCloudProvider()" style="margin-top:16px;padding:10px 20px;background:var(--accent);border:none;border-radius:6px;cursor:pointer;">Save Provider</button>
+            `);
+        }
+        
+        function updateProviderFields() {
+            const type = document.getElementById('new-provider-type').value;
+            const fields = document.getElementById('provider-fields');
+            if (!type) {
+                fields.innerHTML = '';
+                return;
+            }
+            fields.innerHTML = `
+                <div class="settings-group">
+                    <div class="settings-label">API Key</div>
+                    <input type="password" class="settings-input" id="new-api-key" placeholder="Enter your API key">
+                </div>
+                <div class="settings-group">
+                    <div class="settings-label">Custom Base URL (optional)</div>
+                    <input type="text" class="settings-input" id="new-base-url" placeholder="Leave empty for default">
+                </div>
+            `;
+        }
+        
+        async function saveCloudProvider() {
+            const type = document.getElementById('new-provider-type').value;
+            const apiKey = document.getElementById('new-api-key')?.value;
+            const baseUrl = document.getElementById('new-base-url')?.value;
+            
+            if (!type || !apiKey) {
+                showToast('Please select provider and enter API key', 'error');
+                return;
+            }
+            
+            try {
+                const resp = await fetch('/api/cloud-providers', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        provider_type: type,
+                        api_key: apiKey,
+                        base_url: baseUrl
+                    })
+                });
+                if (resp.ok) {
+                    showToast('Provider added!', 'success');
+                    closeModal();
+                    await loadCloudProviders();
+                    await loadCloudModels();
+                } else {
+                    showToast('Failed to add provider', 'error');
+                }
+            } catch(e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+        
+        async function toggleCloudProvider(id, enabled) {
+            try {
+                await fetch(`/api/cloud-providers/${id}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: !enabled })
+                });
+                await loadCloudProviders();
+                await loadCloudModels();
+            } catch(e) {
+                showToast('Error updating provider', 'error');
+            }
+        }
+        
+        async function deleteCloudProvider(id) {
+            if (!confirm('Delete this provider?')) return;
+            try {
+                await fetch(`/api/cloud-providers/${id}`, { method: 'DELETE' });
+                await loadCloudProviders();
+                await loadCloudModels();
+                showToast('Provider deleted', 'success');
+            } catch(e) {
+                showToast('Error deleting provider', 'error');
+            }
         }
         
         document.addEventListener('keydown', (e) => {

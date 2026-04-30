@@ -92,8 +92,93 @@ async def init_db():
             value TEXT
         )
     """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS cloud_providers (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            provider_type TEXT NOT NULL,
+            api_key TEXT,
+            base_url TEXT,
+            models TEXT,
+            enabled INTEGER DEFAULT 1,
+            created_at INTEGER
+        )
+    """)
     await db.commit()
     await db.close()
+
+CLOUD_PROVIDERS = {
+    "openai": {
+        "name": "OpenAI",
+        "base_url": "https://api.openai.com/v1",
+        "default_models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
+        "supports_vision": True,
+        "supports_streaming": True
+    },
+    "anthropic": {
+        "name": "Anthropic (Claude)",
+        "base_url": "https://api.anthropic.com/v1",
+        "default_models": ["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-opus-20240229", "claude-3-haiku-20240307"],
+        "supports_vision": True,
+        "supports_streaming": True
+    },
+    "google": {
+        "name": "Google Gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "default_models": ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
+        "supports_vision": True,
+        "supports_streaming": True
+    },
+    "azure": {
+        "name": "Azure OpenAI",
+        "base_url": "",
+        "default_models": ["gpt-4", "gpt-35-turbo"],
+        "supports_vision": True,
+        "supports_streaming": True
+    },
+    "deepseek": {
+        "name": "DeepSeek API",
+        "base_url": "https://api.deepseek.com/v1",
+        "default_models": ["deepseek-chat", "deepseek-coder"],
+        "supports_vision": False,
+        "supports_streaming": True
+    },
+    "cohere": {
+        "name": "Cohere",
+        "base_url": "https://api.cohere.ai/v2",
+        "default_models": ["command-r-plus", "command-r", "command"],
+        "supports_vision": False,
+        "supports_streaming": True
+    },
+    "xai": {
+        "name": "xAI (Grok)",
+        "base_url": "https://api.x.ai/v1",
+        "default_models": ["grok-2", "grok-2-vision-1212"],
+        "supports_vision": True,
+        "supports_streaming": True
+    },
+    "mistral": {
+        "name": "Mistral AI",
+        "base_url": "https://api.mistral.ai/v1",
+        "default_models": ["mistral-large-latest", "mistral-small-latest", "codestral-latest"],
+        "supports_vision": False,
+        "supports_streaming": True
+    },
+    "perplexity": {
+        "name": "Perplexity",
+        "base_url": "https://api.perplexity.ai",
+        "default_models": ["llama-3.1-sonar-small-128k-online", "llama-3.1-sonar-large-128k-online"],
+        "supports_vision": False,
+        "supports_streaming": True
+    },
+    "openrouter": {
+        "name": "OpenRouter (Aggregated)",
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_models": ["openai/gpt-4o", "anthropic/claude-3.5-sonnet", "google/gemini-pro-1.5"],
+        "supports_vision": True,
+        "supports_streaming": True
+    }
+}
 
 async def get_ollama_client():
     global http_client
@@ -316,7 +401,7 @@ async def upload_image(file: UploadFile = File(...)):
 
 @app.post("/api/ocr")
 async def ocr_image(data: dict):
-    client = await get_ollaa_client()
+    client = await get_ollama_client()
     b64 = data.get("base64", "")
     resp = await client.post("/api/chat", json={
         "model": "llama3.2-vision:11b",
@@ -522,6 +607,222 @@ async def set_setting(key: str, value: str):
     await db.commit()
     await db.close()
     return {"success": True}
+
+@app.get("/api/cloud-providers")
+async def list_cloud_providers():
+    db = await get_db()
+    rows = await db.execute("SELECT * FROM cloud_providers ORDER BY name")
+    results = []
+    async for row in rows:
+        r = dict(row)
+        if r.get("api_key"):
+            r["api_key"] = r["api_key"][:8] + "..." if len(r["api_key"]) > 8 else "***"
+        results.append(r)
+    await db.close()
+    return results
+
+@app.get("/api/cloud-providers/available")
+async def get_available_providers():
+    return CLOUD_PROVIDERS
+
+@app.post("/api/cloud-providers")
+async def add_cloud_provider(data: dict):
+    db = await get_db()
+    provider_id = str(uuid.uuid4())
+    now = int(time.time())
+    provider_type = data.get("provider_type", "")
+    
+    provider_info = CLOUD_PROVIDERS.get(provider_type, {})
+    base_url = data.get("base_url", provider_info.get("base_url", ""))
+    models = data.get("models", provider_info.get("default_models", []))
+    
+    await db.execute("""
+        INSERT INTO cloud_providers (id, name, provider_type, api_key, base_url, models, enabled, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        provider_id,
+        data.get("name", provider_info.get("name", provider_type)),
+        provider_type,
+        data.get("api_key", ""),
+        base_url,
+        json.dumps(models),
+        1,
+        now
+    ))
+    await db.commit()
+    await db.close()
+    return {"id": provider_id, "success": True}
+
+@app.put("/api/cloud-providers/{provider_id}")
+async def update_cloud_provider(provider_id: str, data: dict):
+    db = await get_db()
+    updates = []
+    values = []
+    if "name" in data:
+        updates.append("name = ?")
+        values.append(data["name"])
+    if "api_key" in data:
+        updates.append("api_key = ?")
+        values.append(data["api_key"])
+    if "base_url" in data:
+        updates.append("base_url = ?")
+        values.append(data["base_url"])
+    if "models" in data:
+        updates.append("models = ?")
+        values.append(json.dumps(data["models"]))
+    if "enabled" in data:
+        updates.append("enabled = ?")
+        values.append(1 if data["enabled"] else 0)
+    
+    if updates:
+        values.append(provider_id)
+        await db.execute(f"UPDATE cloud_providers SET {', '.join(updates)} WHERE id = ?", values)
+        await db.commit()
+    await db.close()
+    return {"success": True}
+
+@app.delete("/api/cloud-providers/{provider_id}")
+async def delete_cloud_provider(provider_id: str):
+    db = await get_db()
+    await db.execute("DELETE FROM cloud_providers WHERE id = ?", (provider_id,))
+    await db.commit()
+    await db.close()
+    return {"success": True}
+
+@app.get("/api/cloud-models")
+async def list_all_cloud_models():
+    db = await get_db()
+    rows = await db.execute("SELECT * FROM cloud_providers WHERE enabled = 1")
+    all_models = []
+    async for row in rows:
+        r = dict(row)
+        provider_info = CLOUD_PROVIDERS.get(r["provider_type"], {})
+        models = json.loads(r.get("models", "[]"))
+        for model in models:
+            all_models.append({
+                "id": f"{r['provider_type']}:{model}",
+                "name": model,
+                "provider": r["name"],
+                "provider_type": r["provider_type"],
+                "supports_vision": provider_info.get("supports_vision", False),
+                "enabled": r["enabled"]
+            })
+    await db.close()
+    return all_models
+
+@app.post("/api/chat/cloud")
+async def chat_with_cloud(data: dict):
+    model_id = data.get("model", "")
+    messages = data.get("messages", [])
+    stream = data.get("stream", False)
+    temperature = data.get("temperature", 0.7)
+    max_tokens = data.get("max_tokens", 4096)
+    
+    if ":" not in model_id:
+        raise HTTPException(status_code=400, detail="Invalid cloud model format")
+    
+    provider_type, model_name = model_id.split(":", 1)
+    
+    db = await get_db()
+    row = await db.execute("SELECT * FROM cloud_providers WHERE provider_type = ? AND enabled = 1", (provider_type,))
+    provider = await row.fetchone()
+    await db.close()
+    
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider not found or disabled")
+    
+    if not provider["api_key"]:
+        raise HTTPException(status_code=400, detail="API key not configured")
+    
+    provider_info = CLOUD_PROVIDERS.get(provider_type, {})
+    base_url = provider["base_url"] or provider_info.get("base_url", "")
+    
+    headers = {}
+    payload = {
+        "model": model_name,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+    
+    if provider_type == "openai":
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
+        headers["Content-Type"] = "application/json"
+        if stream:
+            payload["stream"] = True
+    
+    elif provider_type == "anthropic":
+        headers["x-api-key"] = provider["api_key"]
+        headers["anthropic-version"] = "2023-06-01"
+        headers["Content-Type"] = "application/json"
+        payload["system"] = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
+        anthropic_messages = [{"role": m["role"], "content": m["content"]} for m in messages if m["role"] != "system"]
+        payload["messages"] = anthropic_messages
+    
+    elif provider_type == "google":
+        headers["Content-Type"] = "application/json"
+        url = f"{base_url}/models/{model_name}:generateContent"
+        payload["contents"] = [{"role": "user", "parts": [{"text": m["content"]} for m in messages]}]
+        payload["generationConfig"] = {"temperature": temperature, "maxOutputTokens": max_tokens}
+    
+    elif provider_type == "deepseek":
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
+        headers["Content-Type"] = "application/json"
+    
+    elif provider_type == "cohere":
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
+        headers["Content-Type"] = "application/json"
+        payload["model"] = model_name
+    
+    elif provider_type == "xai":
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
+        headers["Content-Type"] = "application/json"
+    
+    elif provider_type == "mistral":
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
+        headers["Content-Type"] = "application/json"
+    
+    elif provider_type == "perplexity":
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
+        headers["Content-Type"] = "application/json"
+    
+    elif provider_type == "openrouter":
+        headers["Authorization"] = f"Bearer {provider['api_key']}"
+        headers["Content-Type"] = "application/json"
+        headers["HTTP-Referer"] = "http://localhost:8080"
+        headers["X-Title"] = "LocalMind"
+    
+    elif provider_type == "azure":
+        headers["api-key"] = provider["api_key"]
+        headers["Content-Type"] = "application/json"
+        url = f"{base_url}/openai/deployments/{model_name}/chat/completions?api-version=2024-02-01"
+        if stream:
+            url += "&api-version=2024-02-15-preview"
+    
+    async def generate():
+        async with httpx.AsyncClient(timeout=None) as client:
+            if provider_type == "google":
+                resp = await client.post(url, headers=headers, json=payload, params={"key": provider["api_key"].split("=")[-1] if "=" in provider["api_key"] else provider["api_key"]})
+            elif provider_type == "azure":
+                resp = await client.post(url, headers=headers, json=payload)
+            else:
+                resp = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+            
+            if stream:
+                async for line in resp.aiter_lines():
+                    if line.strip():
+                        if provider_type == "anthropic":
+                            if line.startswith("data: "):
+                                yield line + "\n\n"
+                        else:
+                            if line.startswith("data: "):
+                                yield line + "\n\n"
+                yield "data: [DONE]\n\n"
+            else:
+                result = resp.json()
+                yield f"data: {json.dumps(result)}\n\n"
+    
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn
